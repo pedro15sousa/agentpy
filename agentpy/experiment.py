@@ -6,6 +6,8 @@ Content: Experiment class
 import warnings
 import pandas as pd
 import random as rd
+import os
+import pickle
 
 from os import sys
 
@@ -46,12 +48,13 @@ class Experiment:
     """
 
     def __init__(self, model_class, sample=None, iterations=1,
-                 record=False, randomize=True, **kwargs):
+                 record=False, reporters_file="reporters.csv", randomize=True, **kwargs):
 
         self.model = model_class
         self.output = DataDict()
         self.iterations = iterations
         self.record = record
+        self.reporters_file = reporters_file
         self._model_kwargs = kwargs
         self.name = model_class.__name__
 
@@ -183,10 +186,23 @@ class Experiment:
             results = model.run(display=False)
         if 'variables' in results and self.record is False:
             del results['variables']  # Remove dynamic variables from record
+
+        # Append reporters to CSV file
+        pd.DataFrame(results['reporters']).to_csv(self.reporters_file, mode='a', header=False)
+        # Save the run_id to the finished_run_ids file
+        if os.path.exists('finished_run_ids.pkl'):
+            with open('finished_run_ids.pkl', 'rb') as f:
+                finished_run_ids = pickle.load(f)
+        else:
+            finished_run_ids = []
+        finished_run_ids.append(run_id)
+        with open('finished_run_ids.pkl', 'wb') as f:
+            pickle.dump(finished_run_ids, f)
+
         return results
 
     # TODO AgentPy 0.2.0 - Remove pool argument
-    def run(self, n_jobs=1, pool=None, display=True, **kwargs):
+    def run(self, n_jobs=1, pool=None, display=True, new_experiment=False, **kwargs):
         """ Perform the experiment.
         The simulation will run the model once for each set of parameters
         and will repeat this process for the set number of iterations.
@@ -224,9 +240,34 @@ class Experiment:
                 results = exp.run(n_jobs=-1, verbose=10)
         """
 
+        # If this is a new experiment, delete the last_run_id and finished_run_ids files
+        if new_experiment:
+            if os.path.exists('last_run_id.pkl'):
+                os.remove('last_run_id.pkl')
+            if os.path.exists('finished_run_ids.pkl'):
+                os.remove('finished_run_ids.pkl')
+
+        if os.path.exists('last_run_id.pkl'):
+            with open('last_run_id.pkl', 'rb') as f:
+                last_run_id = pickle.load(f) + 1
+        else:
+            last_run_id = 0
+
+        # Check if the finished_run_ids file exists
+        if os.path.exists('finished_run_ids.pkl'):
+            # If it exists, load the finished run_ids from the file
+            with open('finished_run_ids.pkl', 'rb') as f:
+                finished_run_ids = pickle.load(f)
+        else:
+            # If it doesn't exist, start from the beginning
+            finished_run_ids = []
+        
+        remaining_run_ids = [run_id for run_id in self.run_ids if run_id not in finished_run_ids]
+        print(remaining_run_ids)
+
         if display:
             n_runs = self.n_runs
-            print(f"Scheduled runs: {n_runs}")
+            print(f"Scheduled runs: {len(remaining_run_ids)}")
         t0 = datetime.now()  # Time-Stamp Start
         combined_output = {}
 
@@ -234,15 +275,15 @@ class Experiment:
         if n_jobs != 1:
             # output_list = pool.map(self._single_sim, self.run_ids)
             output_list = Parallel(n_jobs=n_jobs, **kwargs)(
-                delayed(self._single_sim)(i) for i in self.run_ids)
-            for single_output in output_list:
+                delayed(self._single_sim)(i) for i in remaining_run_ids)
+            for run_id, single_output in zip(remaining_run_ids, output_list):
                 self._add_single_output_to_combined(
                     single_output, combined_output)
 
         # Normal processing
         elif pool is None:
             i = -1
-            for run_id in self.run_ids:
+            for run_id in self.run_ids[last_run_id]:
                 self._add_single_output_to_combined(
                     self._single_sim(run_id), combined_output)
                 if display:
@@ -252,6 +293,10 @@ class Experiment:
                                                * (n_runs - i - 1)))
                     print(f"\rCompleted: {i + 1}, "
                           f"estimated time remaining: {te}", end='')
+                # Save the current run_id to a file
+                with open('last_run_id.pkl', 'wb') as f:
+                    pickle.dump(run_id, f)
+                    
             if display:
                 print("")  # Because the last print ended without a line-break
 
