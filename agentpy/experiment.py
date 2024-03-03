@@ -8,6 +8,7 @@ import pandas as pd
 import random as rd
 import os
 import pickle
+import sqlite3
 
 from os import sys
 
@@ -48,15 +49,19 @@ class Experiment:
     """
 
     def __init__(self, model_class, sample=None, iterations=1,
-                 record=False, reporters_file="reporters.csv", randomize=True, **kwargs):
+                 record=False, reporters_file="reporters.csv", new_experiment=True, randomize=True, **kwargs):
 
         self.model = model_class
         self.output = DataDict()
         self.iterations = iterations
         self.record = record
         self.reporters_file = reporters_file
+        self.new_experiment = new_experiment
         self._model_kwargs = kwargs
         self.name = model_class.__name__
+
+        self.db_path = "simulation.db"
+        self._initialise_db()
 
         # Prepare sample
         if isinstance(sample, Sample):
@@ -115,6 +120,58 @@ class Experiment:
             'iterations': iterations
         }
         self._parameters_to_output()
+
+    def _initialise_db(self):
+        if self.new_experiment and os.path.exists(self.db_path):
+            os.remove(self.db_path) # Delete the existing database for a fresh start
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                param_index INTEGER,
+                iteration INTEGER,
+                status TEXT NOT NULL,
+                PRIMARY KEY (param_index, iteration)
+            )''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS results (
+                param_index INTEGER,
+                iteration INTEGER,
+                result_data TEXT,
+                FOREIGN KEY (param_index, iteration) REFERENCES jobs(param_index, iteration)
+            )''')
+        conn.commit()
+        conn.close()
+    
+    def _mark_job_as_completed(self, job_id, result_data):
+        """Marks a job as completed and stores the result."""
+        param_index, iteration = job_id  # Unpack the tuple
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            # Update job status using the composite key
+            cursor.execute("UPDATE jobs SET status = 'completed' WHERE param_index = ? AND iteration = ?", (param_index, iteration))
+
+            # Insert results into the results table using the composite key
+            cursor.execute("INSERT INTO results (param_index, iteration, result_data) VALUES (?, ?, ?)", (param_index, iteration, result_data))
+
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+        finally:
+            conn.close()
+
+
+    def _get_remaining_jobs(self):
+        """Retrieves a list of job IDs that are not yet completed."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT param_index, iteration FROM jobs WHERE status != 'completed'")
+        remaining_jobs = cursor.fetchall()
+        conn.close()
+        return remaining_jobs
 
     def _parameters_to_output(self):
         """ Document parameters (separately for fixed & variable). """
@@ -177,6 +234,7 @@ class Experiment:
 
     def _single_sim(self, run_id):
         """ Perform a single simulation."""
+        param_index, iteration = run_id
         sample_id = 0 if run_id[0] is None else run_id[0]
         parameters = self.sample[sample_id]
         model = self.model(parameters, _run_id=run_id, **self._model_kwargs)
@@ -186,18 +244,20 @@ class Experiment:
             results = model.run(display=False)
         if 'variables' in results and self.record is False:
             del results['variables']  # Remove dynamic variables from record
-
-        # Append reporters to CSV file
-        pd.DataFrame(results['reporters']).to_csv(self.reporters_file, mode='a', header=False)
-        # Save the run_id to the finished_run_ids file
-        if os.path.exists('finished_run_ids.pkl'):
-            with open('finished_run_ids.pkl', 'rb') as f:
-                finished_run_ids = pickle.load(f)
-        else:
-            finished_run_ids = []
-        finished_run_ids.append(run_id)
-        with open('finished_run_ids.pkl', 'wb') as f:
-            pickle.dump(finished_run_ids, f)
+        
+        # pd.DataFrame(results['reporters']).to_csv(self.reporters_file, mode='a', header=False)
+        serialised_results = pickle.dumps(results['reporters'])
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            # Update job status and insert results using composite key
+            cursor.execute("UPDATE jobs SET status = 'completed' WHERE param_index = ? AND iteration = ?", (param_index, iteration))
+            cursor.execute("INSERT INTO results (param_index, iteration, result_data) VALUES (?, ?, ?)", (param_index, iteration, serialised_results))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+        finally:
+            conn.close()
 
         return results
 
@@ -241,28 +301,17 @@ class Experiment:
         """
 
         # If this is a new experiment, delete the last_run_id and finished_run_ids files
-        if new_experiment:
-            if os.path.exists('last_run_id.pkl'):
-                os.remove('last_run_id.pkl')
-            if os.path.exists('finished_run_ids.pkl'):
-                os.remove('finished_run_ids.pkl')
-
-        if os.path.exists('last_run_id.pkl'):
-            with open('last_run_id.pkl', 'rb') as f:
-                last_run_id = pickle.load(f) + 1
+        if self.new_experiment:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            for param_index, iteration in self.run_ids:
+                cursor.execute("INSERT INTO jobs (param_index, iteration, status) VALUES (?, ?, 'pending')", (param_index, iteration))
+            conn.commit()
+            conn.close()
+            remaining_run_ids = self.run_ids
         else:
-            last_run_id = 0
-
-        # Check if the finished_run_ids file exists
-        if os.path.exists('finished_run_ids.pkl'):
-            # If it exists, load the finished run_ids from the file
-            with open('finished_run_ids.pkl', 'rb') as f:
-                finished_run_ids = pickle.load(f)
-        else:
-            # If it doesn't exist, start from the beginning
-            finished_run_ids = []
+            remaining_run_ids = self._get_remaining_jobs()
         
-        remaining_run_ids = [run_id for run_id in self.run_ids if run_id not in finished_run_ids]
         print(remaining_run_ids)
 
         if display:
@@ -283,7 +332,7 @@ class Experiment:
         # Normal processing
         elif pool is None:
             i = -1
-            for run_id in self.run_ids[last_run_id]:
+            for run_id in remaining_run_ids:
                 self._add_single_output_to_combined(
                     self._single_sim(run_id), combined_output)
                 if display:
