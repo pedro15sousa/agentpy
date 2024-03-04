@@ -49,18 +49,17 @@ class Experiment:
     """
 
     def __init__(self, model_class, sample=None, iterations=1,
-                 record=False, reporters_file="reporters.csv", new_experiment=True, randomize=True, **kwargs):
+                 record=False, db_path="simulation.db", new_experiment=True, randomize=True, **kwargs):
 
         self.model = model_class
         self.output = DataDict()
         self.iterations = iterations
         self.record = record
-        self.reporters_file = reporters_file
         self.new_experiment = new_experiment
         self._model_kwargs = kwargs
         self.name = model_class.__name__
 
-        self.db_path = "simulation.db"
+        self.db_path = db_path
         self._initialise_db()
 
         # Prepare sample
